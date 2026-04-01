@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mini Geometry Dash 2.1 - Ultimate Update</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        html, body { margin:0; padding:0; overflow:hidden; background:#111; touch-action: none; user-select: none; font-family: Arial, sans-serif; }
+        canvas { display:block; }
+    </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const BASE_W = 800, BASE_H = 400; 
+let scale = 1;
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    scale = Math.min(canvas.width/BASE_W, canvas.height/BASE_H);
+}
+window.addEventListener("resize", resize);
+resize();
+function s(v){ return v*scale; }
+
+// --- ADVANCED AUDIO SYSTEM ---
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playSound(freq, dur=0.1, type="square", slideTo=null) {
+    if(audioCtx.state === 'suspended') audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    
+    osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+    if(slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, audioCtx.currentTime + dur);
+    
+    osc.type = type;
+    gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur); 
+    
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + dur);
+}
+
+const bgmNotes = [261.63, 392.00, 329.63, 523.25, 392.00, 659.25, 523.25, 392.00]; 
+let noteIndex = 0;
+let musicInterval = null;
+
+function startMusic() {
+    if(musicInterval) clearInterval(musicInterval);
+    if(audioCtx.state === 'suspended') audioCtx.resume();
+    musicInterval = setInterval(() => {
+        if(gameState === "playing") {
+            playSound(bgmNotes[noteIndex], 0.15, "triangle");
+            noteIndex = (noteIndex + 1) % bgmNotes.length;
+        }
+    }, 150); 
+}
+
+// --- DATA ARRAYS & REQUIREMENTS ---
+const reqs = {
+    colors: { white:0, blue:1000, red:2000, green:3000, purple:4000, orange:5000, pink:6000, gold:7000, rainbow:8000, void:10000 },
+    trails: { none:0, basic:0, long:1000, ghost:2000, fire:3000, pixel:4000, rainbow:5000, void:8000 },
+    cosmetics: { none:0, crown:1500, spikes:2500 },
+    faces: { none:0, ":)":0, "OwO":500, "x_x":1000, ">_<":1500, "CUSTOM":2000 }
+};
+
+const items = {
+    colors: Object.keys(reqs.colors),
+    trails: Object.keys(reqs.trails),
+    cosmetics: Object.keys(reqs.cosmetics),
+    faces: Object.keys(reqs.faces)
+};
+
+// --- GAME STATE & VARIABLES ---
+let gameState = "home"; 
+let level = 1, selectedLevel = 1;
+let score = 0, highScore = 0;
+let scrollX = 0, screenShake = 0;
+
+let shopTab = "colors";
+let shopMessage = "";
+let shopMessageTimer = 0;
+
+let player = {
+    x:s(100), y:s(300), size:s(30), 
+    vy:0, roll:0, sx:1, sy:1, 
+    doubleJump:false, jumpsLeft:0, shield:0
+};
+let gravity = 1.0, jumpVel = -15, padJump = -25, onGround = true;
+
+// Unlocks & Current Selection
+let unlocked = {
+    colors: { white:true },
+    trails: { none:true, basic:true },
+    cosmetics: { none:true },
+    faces: { none:true, ":)":true }
+};
+let current = { color: "white", trail: "basic", cosmetic: "none", face: "none" };
+let customFaceString = "B)";
+
+let obstacles=[], safePillars=[], jumpPads=[], doubleJumps=[], shields=[], doubleScorePowerUps=[];
+let particles = [], trailPositions = [], stars = [], mountains = [];
+let doubleScoreActive = false, doubleScoreTimer = 0, powerUpSpawnTimer = 300;
+
+let levelSpeeds = {1:4.0, 2:4.5, 3:5.0, 4:5.5, 5:6.0, 6:6.5};
+let baseSpeed = levelSpeeds[1];
+
+for(let i=0; i<100; i++) stars.push({x:Math.random(), y:Math.random()});
+for(let i=0; i<20; i++) mountains.push({x:Math.random(), w:0.1+Math.random()*0.2, h:0.2+Math.random()*0.3});
+
+// --- SAVE SYSTEM ---
+function saveGame() {
+    try {
+        localStorage.setItem("miniDashSave", JSON.stringify({
+            highScore, unlocked, current, customFaceString
+        }));
+    } catch(e) {}
+}
+
+function loadGame() {
+    try {
+        let saved = localStorage.getItem("miniDashSave");
+        if(saved) {
+            let data = JSON.parse(saved);
+            if(data.highScore) highScore = data.highScore;
+            if(data.unlocked) unlocked = data.unlocked;
+            if(data.current) current = data.current;
+            if(data.customFaceString) customFaceString = data.customFaceString;
+        }
+    } catch(e) {}
+    checkUnlocks(); // Make sure score-based unlocks trigger
+}
+loadGame();
+
+function clearData() {
+    if(confirm("Are you sure you want to delete all progress?")) {
+        localStorage.clear();
+        location.reload();
+    }
+}
+
+function spawnParticles(x, y, color, amount, speed) {
+    for(let i=0; i<amount; i++) {
+        particles.push({
+            x: x, y: y,
+            vx: (Math.random()-0.5)*speed, vy: (Math.random()-0.5)*speed - speed/2,
+            life: 1.0, color: color, size: s(Math.random()*8 + 4)
+        });
+    }
+}
+
+function generateLevel(lvl){
+    obstacles=[]; safePillars=[]; jumpPads=[]; doubleJumps=[]; shields=[]; doubleScorePowerUps=[];
+    baseSpeed = levelSpeeds[lvl];
+    const o=(x,y,w,h)=>({x:s(x),y:s(y),w:s(w),h:s(h)});
+    for(let i=0;i<4+lvl;i++) obstacles.push(o(800+i*350, 300, 30, 30));
+    if(lvl>1) safePillars.push(o(1000,240,100,15));
+    if(lvl>2) jumpPads.push(o(1300,310,40,20));
+    doubleJumps.push({x:s(1600), y:s(220), size:s(25), w:s(25), h:s(25)});
+    shields.push({x:s(2200), y:s(250), size:s(25), w:s(25), h:s(25)});
+}
+
+function jump() {
+    if(onGround){
+        player.vy = jumpVel*scale;
+        player.sx = 0.6; player.sy = 1.4; 
+        onGround=false;
+        playSound(300, 0.2, "square", 600); 
+    } else if(player.doubleJump && player.jumpsLeft>0){
+        player.vy = jumpVel*scale;
+        player.jumpsLeft--; player.doubleJump=false;
+        spawnParticles(player.x+player.size/2, player.y+player.size, "cyan", 10, 10);
+        playSound(500, 0.2, "square", 1000); 
+    }
+}
+
+document.addEventListener("keydown", e => {
+    if(e.code==="Space" && gameState==="playing") jump();
+    if(e.code==="Escape" || e.code==="ShiftLeft") gameState = "home";
+});
+
+canvas.addEventListener("pointerdown", e => {
+    if(audioCtx.state === 'suspended') audioCtx.resume();
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if(gameState === "playing") {
+        jump();
+    } else if(gameState === "gameover") {
+        startGame(selectedLevel);
+    } else if(gameState === "home") {
+        // Centered Levels Grid Check
+        for(let i=1; i<=6; i++) {
+            let col = (i-1) % 3; let row = Math.floor((i-1) / 3);
+            let bx = canvas.width/2 + s((col - 1) * 140) - s(60);
+            let by = canvas.height/2 + s(row * 80) - s(40);
+            if(x > bx && x < bx+s(120) && y > by && y < by+s(60)) {
+                selectedLevel = i; playSound(800, 0.1, "sine"); 
+            }
+        }
+        // PLAY Button
+        if(x > canvas.width/2 - s(100) && x < canvas.width/2 + s(100) && y > canvas.height/2 + s(150) && y < canvas.height/2 + s(210)){
+            startGame(selectedLevel);
+        }
+        // SHOP Button
+        if(x > canvas.width/2 - s(65) && x < canvas.width/2 + s(65) && y > s(20) && y < s(70)) {
+            gameState = "shop"; playSound(800, 0.1, "sine");
+        }
+        // CLEAR DATA Button (Top Right)
+        if(x > canvas.width - s(130) && x < canvas.width - s(10) && y > s(10) && y < s(60)) {
+            clearData();
+        }
+        
+    } else if(gameState === "shop") {
+        // Back Button
+        if(x > s(20) && x < s(100) && y > s(20) && y < s(70)) { gameState = "home"; playSound(600, 0.1, "sine"); }
+        
+        // Tab Headers
+        let tabs = ["colors", "trails", "cosmetics", "faces"];
+        tabs.forEach((tab, i) => {
+            let bx = canvas.width/2 - s(300) + i*s(150);
+            if(x > bx && x < bx+s(140) && y > s(90) && y < s(140)) {
+                shopTab = tab; playSound(1000, 0.1, "sine");
+            }
+        });
+
+        // Shop Items Grid
+        let currentItems = items[shopTab];
+        currentItems.forEach((item, i) => {
+            let col = i % 5; let row = Math.floor(i / 5);
+            let bx = canvas.width/2 - s(350) + col*s(140);
+            let by = s(180) + row*s(80);
+            
+            if(x > bx && x < bx+s(120) && y > by && y < by+s(60)) {
+                let cost = reqs[shopTab][item];
+                if(unlocked[shopTab][item]) {
+                    if(item === "CUSTOM" && shopTab === "faces") {
+                        let res = prompt("Enter a custom face (1-3 chars):", customFaceString);
+                        if(res !== null) customFaceString = res.substring(0,3);
+                    }
+                    current[shopTab.slice(0,-1)] = item; // Map 'colors' to 'color', etc.
+                    playSound(1000, 0.1, "sine");
+                    saveGame();
+                } else if(highScore >= cost) {
+                    unlocked[shopTab][item] = true;
+                    shopMessage = `UNLOCKED ${item.toUpperCase()}!`;
+                    shopMessageTimer = 120;
+                    playSound(1200, 0.3, "sine", 2000);
+                    saveGame();
+                } else {
+                    shopMessage = `REQUIRES ${cost} SCORE`;
+                    shopMessageTimer = 90;
+                    playSound(200, 0.2, "sawtooth");
+                }
+            }
+        });
+    }
+});
+
+function startGame(lvl){
+    gameState="playing"; level=lvl; score=0; scrollX=0; screenShake=0;
+    player.y=s(300); player.vy=0; player.roll=0; player.sx=1; player.sy=1; 
+    player.doubleJump=false; player.jumpsLeft=0; player.shield=0;
+    onGround=true; trailPositions=[]; particles=[]; doubleScorePowerUps=[];
+    doubleScoreActive=false; doubleScoreTimer=0; powerUpSpawnTimer=300;
+    generateLevel(level);
+    playSound(1200, 0.3, "sine", 2000); 
+    startMusic(); 
+}
+
+function update(){
+    if(gameState!=="playing") return;
+    
+    scrollX += baseSpeed * scale;
+    if(screenShake > 0) screenShake *= 0.9; 
+    player.sx += (1 - player.sx) * 0.2; 
+    player.sy += (1 - player.sy) * 0.2;
+
+    let wasOnGround = onGround;
+    player.vy += gravity*scale;
+    player.y += player.vy;
+
+    if(!onGround) {
+        player.roll += 0.15;
+    } else {
+        let targetRoll = Math.round(player.roll / (Math.PI/2)) * (Math.PI/2);
+        player.roll += (targetRoll - player.roll) * 0.3; 
+    }
+
+    if(player.y >= s(300)){ player.y=s(300); player.vy=0; onGround=true; }
+
+    if(!wasOnGround && onGround) {
+        player.sx = 1.4; player.sy = 0.6; 
+        spawnParticles(player.x+player.size/2, player.y+player.size, "white", 5, 5); 
+        playSound(100, 0.1, "triangle", 40); 
+    }
+
+    if(current.trail !== "none") {
+        trailPositions.push({x: player.x, y: player.y, roll: player.roll, sx: player.sx, sy: player.sy});
+        let maxLen = current.trail==="long" ? 20 : (current.trail==="pixel" ? 2 : 8);
+        if(trailPositions.length > maxLen) trailPositions.shift();
+    }
+
+    const checkHit = (obj) => {
+        let margin = s(4); 
+        return player.x + margin < obj.x + obj.w && 
+               player.x + player.size - margin > obj.x && 
+               player.y + margin < obj.y + obj.h && 
+               player.y + player.size - margin > obj.y;
+    };
+
+    powerUpSpawnTimer--;
+    if(powerUpSpawnTimer <= 0){
+        doubleScorePowerUps.push({
+            x: canvas.width + Math.random()*s(300),
+            y: s(150 + Math.random()*100),
+            w: s(25), h: s(25)
+        });
+        powerUpSpawnTimer = 400 + Math.floor(Math.random()*200);
+    }
+
+    doubleScorePowerUps.forEach((p,index)=>{
+        p.x -= baseSpeed*scale;
+        if(p.x < -p.w) doubleScorePowerUps.splice(index,1);
+        if(checkHit(p)){
+            doubleScoreActive = true;
+            doubleScoreTimer = 300;
+            playSound(1200, 0.3, "sine", 2400); 
+            spawnParticles(p.x, p.y, "cyan", 20, 10);
+            doubleScorePowerUps.splice(index,1);
+        }
+    });
+
+    doubleJumps.forEach((dj) => {
+        dj.x -= baseSpeed * scale;
+        if(dj.x < -dj.w) dj.x = canvas.width + s(800) + Math.random()*s(1000); 
+        if(checkHit(dj)) {
+            player.doubleJump = true;
+            player.jumpsLeft = 1;
+            playSound(800, 0.2, "sine", 1200);
+            spawnParticles(dj.x, dj.y, "magenta", 20, 10);
+            dj.x = canvas.width + s(800) + Math.random()*s(1000); 
+        }
+    });
+
+    shields.forEach((sh) => {
+        sh.x -= baseSpeed * scale;
+        if(sh.x < -sh.w) sh.x = canvas.width + s(1200) + Math.random()*s(1200);
+        if(checkHit(sh)) {
+            player.shield = 1;
+            playSound(600, 0.2, "square", 1000);
+            spawnParticles(sh.x, sh.y, "blue", 20, 10);
+            sh.x = canvas.width + s(1200) + Math.random()*s(1200);
+        }
+    });
+
+    obstacles.forEach((o,i) => {
+        o.x -= baseSpeed * scale;
+        if(o.x < -o.w) {
+            let maxObsX = Math.max(...obstacles.map(obj => obj.x));
+            if (maxObsX < canvas.width) maxObsX = canvas.width;
+            o.x = maxObsX + s(350) + Math.random() * s(300);
+        }
+        
+        if(checkHit(o)) {
+            if (player.shield === 1) {
+                player.shield = 0; screenShake = s(10);
+                playSound(200, 0.3, "sawtooth", 50); player.vy = jumpVel * 0.6 * scale;
+                let maxObsX = Math.max(...obstacles.map(obj => obj.x));
+                o.x = maxObsX + s(300);
+            } else {
+                playSound(150, 0.4, "sawtooth", 40); 
+                spawnParticles(player.x, player.y, current.color==="rainbow"?"white":current.color, 30, 15);
+                gameState = "gameover";
+                checkUnlocks();
+                saveGame();
+            }
+        }
+    });
+
+    safePillars.forEach(p=>{
+        p.x-=baseSpeed*scale;
+        if(p.x<-p.w) p.x=canvas.width+s(600)+Math.random()*s(600);
+        if(player.x+player.size>p.x && player.x<p.x+p.w && player.y+player.size>=p.y && player.y+player.size <= p.y+p.h+Math.abs(player.vy)){
+            player.y=p.y-player.size; player.vy=0; onGround=true;
+        }
+    });
+    if(player.y < s(300) && !safePillars.some(p => player.x+player.size>p.x && player.x<p.x+p.w && player.y+player.size===p.y)) onGround=false;
+
+    jumpPads.forEach(j=>{
+        j.x-=baseSpeed*scale; if(j.x<-j.w) j.x=canvas.width+s(600)+Math.random()*s(800);
+        if(checkHit(j)){ player.vy=padJump*scale; onGround=false; playSound(400,0.2,"square", 800); player.sx=0.4; player.sy=1.8; }
+    });
+
+    score += doubleScoreActive ? 2 : 1;
+    if(score > highScore) highScore = score;
+    if(doubleScoreActive && --doubleScoreTimer <= 0) doubleScoreActive = false;
+
+    particles.forEach(p => { p.x += p.vx; p.y += p.vy; p.life -= 0.02; });
+    particles = particles.filter(p => p.life > 0);
+    
+    if(shopMessageTimer > 0) shopMessageTimer--;
+}
+
+function checkUnlocks() {
+    let changed = false;
+    for(let category in reqs) {
+        for(let item in reqs[category]) {
+            if(!unlocked[category][item] && highScore >= reqs[category][item]) {
+                unlocked[category][item] = true;
+                changed = true;
+            }
+        }
+    }
+    if(changed) saveGame();
+}
+
+// Draw the cool Minecraft End Portal Effect
+function drawVoid(x, y, w, h, isTrail, tOffset) {
+    const t = Date.now()/1000 + tOffset;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip(); // Mask everything inside the square
+    
+    // Pitch black base
+    ctx.fillStyle = "#050510";
+    ctx.fillRect(x, y, w, h);
+    
+    // End Portal Starry Parallax Layers
+    ctx.fillStyle = "#22DD77"; // Bright green specks
+    for(let i=0; i<15; i++) {
+        let px = ((scrollX*0.1 + i*37 + t*20) % w);
+        let py = ((player.y*0.1 + i*43 - t*10) % h);
+        if(px < 0) px += w; if(py < 0) py += h;
+        ctx.fillRect(x + px, y + py, isTrail ? s(1) : s(2), isTrail ? s(1) : s(2));
+    }
+    
+    ctx.fillStyle = "#8822CC"; // Purple specks
+    for(let i=0; i<15; i++) {
+        let px = ((scrollX*0.05 + i*23 - t*15) % w);
+        let py = ((player.y*0.05 + i*17 + t*5) % h);
+        if(px < 0) px += w; if(py < 0) py += h;
+        ctx.fillRect(x + px, y + py, isTrail ? s(1.5) : s(3), isTrail ? s(1.5) : s(3));
+    }
+    ctx.restore();
+}
+
+function draw(){
+    const t = Date.now()/1000;
+    const r = Math.floor(80 + 40*Math.sin(t));
+    const g = Math.floor(80 + 40*Math.sin(t+2));
+    const b = Math.floor(80 + 40*Math.sin(t+4));
+    
+    ctx.fillStyle = gameState==="playing" ? (doubleScoreActive ? "#201" : "#111") : `rgb(${r},${g},${b})`; 
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    ctx.save();
+    if(screenShake > 0) ctx.translate((Math.random()-0.5)*screenShake, (Math.random()-0.5)*screenShake);
+
+    ctx.fillStyle="white";
+    stars.forEach(s_ => {
+        let sx = (s_.x * canvas.width - scrollX * (doubleScoreActive ? 0.2 : 0.1)) % canvas.width;
+        if(sx < 0) sx += canvas.width;
+        ctx.globalAlpha = 0.5 + Math.sin(t*2 + s_.x*10)*0.5;
+        ctx.fillRect(sx, s_.y*canvas.height*0.7, 2, 2);
+    });
+    ctx.globalAlpha = 1.0;
+    
+    ctx.fillStyle = `rgb(${r/2},${g/2},${b/2})`;
+    mountains.forEach(m => {
+        let mx = (m.x * canvas.width - scrollX * 0.3) % canvas.width;
+        if(mx < -canvas.width*m.w) mx += canvas.width*(1+m.w);
+        ctx.beginPath();
+        ctx.moveTo(mx, canvas.height);
+        ctx.lineTo(mx + canvas.width*m.w/2, canvas.height - canvas.height*m.h);
+        ctx.lineTo(mx + canvas.width*m.w, canvas.height);
+        ctx.fill();
+    });
+
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    let floorOffset = scrollX % s(40);
+    ctx.fillRect(0, s(330), canvas.width, canvas.height);
+    ctx.fillStyle = "rgba(0,0,0,0.3)"; 
+    for(let i=-1; i<canvas.width/s(40)+1; i++) ctx.fillRect(i*s(40) - floorOffset, s(330), 2, canvas.height);
+
+    if(gameState === "playing" || gameState === "gameover") {
+        ctx.shadowBlur=15; 
+        ctx.shadowColor="red"; ctx.fillStyle="red"; obstacles.forEach(o=>ctx.fillRect(o.x,o.y,o.w,o.h));
+        ctx.shadowColor="lime"; ctx.fillStyle="lime"; safePillars.forEach(p=>ctx.fillRect(p.x,p.y,p.w,p.h));
+        ctx.shadowColor="magenta"; ctx.fillStyle="magenta"; jumpPads.forEach(j=>ctx.fillRect(j.x,j.y,j.w,j.h));
+        
+        ctx.shadowColor="cyan"; ctx.fillStyle="cyan"; 
+        doubleScorePowerUps.forEach(p=>{
+            ctx.fillRect(p.x, p.y, p.w, p.h);
+            ctx.fillStyle="black"; ctx.font=`bold ${s(14)}px Arial`; ctx.textAlign="center";
+            ctx.fillText("2X", p.x+p.w/2, p.y+p.h/1.5);
+            ctx.fillStyle="cyan"; 
+        });
+
+        ctx.shadowColor="magenta"; ctx.fillStyle="magenta";
+        doubleJumps.forEach(dj => {
+            ctx.beginPath(); ctx.arc(dj.x + dj.w/2, dj.y + dj.h/2, dj.w/2, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle="white"; ctx.font=`bold ${s(12)}px Arial`; ctx.textAlign="center";
+            ctx.fillText("UP", dj.x+dj.w/2, dj.y+dj.h/1.5); ctx.fillStyle="magenta";
+        });
+
+        ctx.shadowColor="blue"; ctx.fillStyle="blue";
+        shields.forEach(sh => {
+            ctx.beginPath(); ctx.arc(sh.x + sh.w/2, sh.y + sh.h/2, sh.w/2, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle="white"; ctx.font=`bold ${s(12)}px Arial`; ctx.textAlign="center";
+            ctx.fillText("S", sh.x+sh.w/2, sh.y+sh.h/1.5); ctx.fillStyle="blue";
+        });
+        
+        ctx.shadowBlur=0;
+
+        if(gameState === "playing") {
+            // Draw Trails
+            trailPositions.forEach((pos, index) => {
+                let p = index / trailPositions.length; 
+                ctx.save();
+                ctx.translate(pos.x+player.size/2, pos.y+player.size/2);
+                ctx.rotate(pos.roll);
+                ctx.scale(pos.sx, pos.sy);
+                
+                if(current.trail === "fire") {
+                    ctx.globalAlpha = p; ctx.fillStyle = `rgb(255, ${Math.floor(p*200)}, 0)`; ctx.translate(0, (1-p)*s(20));
+                } else if(current.trail === "ghost") {
+                    ctx.globalAlpha = p * 0.3; ctx.scale(1 + (1-p)*0.5, 1 + (1-p)*0.5); ctx.fillStyle = "white";
+                } else if (current.trail === "rainbow") {
+                    ctx.globalAlpha = p; ctx.fillStyle = `hsl(${Date.now()%360 + index*10}, 100%, 50%)`;
+                } else if (current.trail === "pixel") {
+                    ctx.globalAlpha = p; ctx.fillStyle = current.color==="rainbow" ? "white" : current.color; ctx.scale(Math.random(), Math.random());
+                } else if (current.trail === "void") {
+                    ctx.globalAlpha = p; drawVoid(-player.size/2, -player.size/2, player.size, player.size, true, index*10);
+                } else {
+                    ctx.globalAlpha = p * 0.5; ctx.fillStyle = current.color==="rainbow" ? "white" : current.color;
+                }
+                
+                if(current.trail !== "void") ctx.fillRect(-player.size/2, -player.size/2, player.size, player.size);
+                ctx.restore();
+            });
+            ctx.globalAlpha = 1.0;
+            
+            let cubeColor = current.color==="rainbow" ? `hsl(${Date.now()%360},100%,50%)` : (current.color==="gold" ? "#FFD700" : current.color);
+            ctx.save();
+            ctx.translate(player.x+player.size/2, player.y+player.size/2);
+            ctx.rotate(player.roll);
+            ctx.scale(player.sx, player.sy);
+            
+            // Render Core Cube
+            if(current.color === "void") {
+                drawVoid(-player.size/2, -player.size/2, player.size, player.size, false, 0);
+            } else {
+                ctx.fillStyle = cubeColor;
+                ctx.shadowColor=cubeColor; ctx.shadowBlur=20;
+                ctx.fillRect(-player.size/2, -player.size/2, player.size, player.size);
+                ctx.shadowBlur=0; 
+            }
+            
+            // Internal shading shadow
+            ctx.fillStyle="rgba(0,0,0,0.3)";
+            ctx.fillRect(-player.size/4, -player.size/4, player.size/2, player.size/2);
+
+            // --- RENDER COSMETICS ---
+            if(current.cosmetic === "crown") {
+                ctx.fillStyle = "gold";
+                ctx.beginPath();
+                ctx.moveTo(-player.size/2.2, -player.size/2);
+                ctx.lineTo(-player.size/2, -player.size/1.1);
+                ctx.lineTo(-player.size/4, -player.size/1.4);
+                ctx.lineTo(0, -player.size/1.0);
+                ctx.lineTo(player.size/4, -player.size/1.4);
+                ctx.lineTo(player.size/2, -player.size/1.1);
+                ctx.lineTo(player.size/2.2, -player.size/2);
+                ctx.fill();
+            } else if (current.cosmetic === "spikes") {
+                ctx.fillStyle = "silver";
+                let hs = player.size/2; let sp = player.size/4;
+                ctx.beginPath(); ctx.moveTo(-sp, -hs); ctx.lineTo(sp, -hs); ctx.lineTo(0, -hs-sp); ctx.fill(); // Top
+                ctx.beginPath(); ctx.moveTo(-sp, hs); ctx.lineTo(sp, hs); ctx.lineTo(0, hs+sp); ctx.fill(); // Bot
+                ctx.beginPath(); ctx.moveTo(-hs, -sp); ctx.lineTo(-hs, sp); ctx.lineTo(-hs-sp, 0); ctx.fill(); // Left
+                ctx.beginPath(); ctx.moveTo(hs, -sp); ctx.lineTo(hs, sp); ctx.lineTo(hs+sp, 0); ctx.fill(); // Right
+            }
+
+            // --- RENDER FACE ---
+            if(current.face !== "none") {
+                let textToDraw = current.face === "CUSTOM" ? customFaceString : current.face;
+                ctx.fillStyle = current.color === "void" || current.color === "black" ? "white" : "black";
+                ctx.font = `bold ${s(12)}px Arial`;
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(textToDraw, 0, 0);
+            }
+
+            ctx.restore();
+
+            // Draw Shield Bubble if active
+            if (player.shield === 1) {
+                ctx.save();
+                ctx.translate(player.x+player.size/2, player.y+player.size/2);
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = "rgba(0, 150, 255, 1)";
+                ctx.strokeStyle = "rgba(0, 150, 255, 0.8)";
+                ctx.lineWidth = s(4);
+                ctx.beginPath();
+                ctx.arc(0, 0, player.size * 0.8, 0, Math.PI*2);
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+
+        particles.forEach(p => {
+            ctx.globalAlpha = p.life;
+            ctx.fillStyle = p.color;
+            ctx.fillRect(p.x, p.y, p.size, p.size);
+        });
+        ctx.globalAlpha = 1.0;
+
+        ctx.fillStyle="white"; ctx.font=`bold ${s(24)}px Arial`; ctx.textAlign="left";
+        ctx.fillText("SCORE: "+score, s(20), s(40));
+        
+        if(doubleScoreActive) {
+            ctx.fillStyle="cyan"; 
+            ctx.fillText("2X MULTIPLIER!", s(20), s(70));
+        }
+
+        ctx.fillStyle="white"; ctx.textAlign="right";
+        ctx.fillText("HIGH: "+highScore, canvas.width - s(20), s(40));
+    }
+
+    if(gameState === "gameover"){
+        ctx.fillStyle="rgba(0,0,0,0.7)"; ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.textAlign="center";
+        ctx.fillStyle="red"; ctx.font=`bold ${s(50)}px Arial`; ctx.fillText("CRASHED",canvas.width/2,canvas.height/2 - s(20));
+        ctx.fillStyle="white"; ctx.font=`${s(20)}px Arial`; ctx.fillText("TAP OR CLICK TO RESTART",canvas.width/2,canvas.height/2 + s(30));
+    }
+
+    function drawButton(text, x, y, w, h, isSelected, isLocked, col) {
+        ctx.fillStyle = isLocked ? "#333" : (isSelected ? "white" : "rgba(0,0,0,0.5)");
+        ctx.strokeStyle = isLocked ? "#111" : (isSelected ? col : "white");
+        ctx.lineWidth = s(3);
+        ctx.beginPath(); ctx.roundRect(x, y, w, h, s(10)); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = isLocked ? "#555" : (isSelected ? "black" : "white");
+        ctx.font = `bold ${s(18)}px Arial`; ctx.textAlign="center"; ctx.textBaseline="middle";
+        ctx.fillText(isLocked ? "🔒" : text, x+w/2, y+h/2);
+    }
+
+    if(gameState === "home"){
+        ctx.textAlign="center"; ctx.textBaseline="alphabetic";
+        ctx.fillStyle="white"; ctx.font=`bold ${s(40)}px Arial`; ctx.fillText("MINI DASH", canvas.width/2, s(80));
+
+        ctx.font=`${s(20)}px Arial`; ctx.fillText("SELECT LEVEL", canvas.width/2, s(140));
+        
+        // Centered grid for 6 buttons
+        for(let i=1; i<=6; i++) {
+            let col = (i-1) % 3;
+            let row = Math.floor((i-1) / 3);
+            let bx = canvas.width/2 + s((col - 1) * 140) - s(60); 
+            let by = canvas.height/2 + s(row * 80) - s(40);
+            drawButton("LVL " + i, bx, by, s(120), s(60), selectedLevel === i, false, "lime");
+        }
+
+        drawButton("PLAY", canvas.width/2 - s(100), canvas.height/2 + s(150), s(200), s(60), false, false, "white");
+        drawButton("SHOP", canvas.width/2 - s(65), s(20), s(130), s(50), false, false, "cyan");
+
+        // Clear Data Button
+        ctx.fillStyle = "rgba(255,0,0,0.3)";
+        ctx.strokeStyle = "red";
+        ctx.beginPath(); ctx.roundRect(canvas.width - s(130), s(10), s(120), s(50), s(5)); ctx.fill(); ctx.stroke();
+        ctx.fillStyle = "white"; ctx.font = `bold ${s(12)}px Arial`; ctx.textAlign="center";
+        ctx.fillText("CLEAR DATA", canvas.width - s(70), s(30));
+        ctx.font = `${s(10)}px Arial`; 
+        ctx.fillText("(for file:// only)", canvas.width - s(70), s(45));
+    }
+
+    if(gameState === "shop"){
+        drawButton("BACK", s(20), s(20), s(100), s(50), false, false, "white");
+        ctx.textAlign="center"; ctx.textBaseline="alphabetic";
+        
+        ctx.fillStyle="white"; ctx.font=`bold ${s(30)}px Arial`; 
+        ctx.fillText("SHOP MENU", canvas.width/2, s(50));
+
+        // Draw Tabs
+        let tabs = ["colors", "trails", "cosmetics", "faces"];
+        tabs.forEach((tab, i) => {
+            let bx = canvas.width/2 - s(300) + i*s(150);
+            drawButton(tab.toUpperCase(), bx, s(90), s(140), s(50), shopTab === tab, false, "yellow");
+        });
+
+        // Draw Items in Tab
+        let currentItems = items[shopTab];
+        currentItems.forEach((item, i) => {
+            let col = i % 5;
+            let row = Math.floor(i / 5);
+            let bx = canvas.width/2 - s(350) + col*s(140);
+            let by = s(180) + row*s(80);
+            let isLocked = !unlocked[shopTab][item];
+            let isSelected = current[shopTab.slice(0,-1)] === item; // mapping 'colors' to 'color'
+            
+            let label = item.toUpperCase();
+            if(item === "CUSTOM" && !isLocked && !isSelected) label = "EDIT";
+            
+            drawButton(label, bx, by, s(120), s(60), isSelected, isLocked, item==="void"?"magenta":"cyan");
+        });
+
+        // Shop Message (Unlock/Requirements)
+        if(shopMessageTimer > 0) {
+            ctx.fillStyle = shopMessage.includes("REQUIRES") ? "red" : "lime";
+            ctx.font=`bold ${s(24)}px Arial`;
+            ctx.fillText(shopMessage, canvas.width/2, canvas.height - s(40));
+        }
+    }
+    ctx.restore();
+}
+
+function loop(){
+    update();
+    draw();
+    requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
